@@ -1,0 +1,42 @@
+# Ignore image files and common data files
+chapter_3/employed_codes/3_analysis_filtered.ipynb
+chapter_2/employed_codes/6_analysis_common_filter.ipynb
+PhD_Thesis/chapter_2/employed_codes/6_analysis_common_filter_6 pc.ipynb
+chapter_2/employed_codes/5_analysis_common.ipynb
+/home/ajarrah/PhD_Thesis/chapter_2/employed_codes/5_analysis_common.ipynb
+chapter_4/employed_codes/3_analysis_filtered.ipynb
+chapter_2/employed_codes/6_analysis_common_filter_6 pc.ipynb
+
+*.ipynb1
+*.png
+*.jpeg
+*.jpg
+*.gif
+*.tiff
+*.bmp
+*.svg
+*.lif 
+*.ipynb_checkpoints/
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+*.pdf
+*.h5ad
+*.imzml
+*.ibd
+*.zip
+*.txt
+*.csv
+*.xlsx
+*.log
+*.out
+*.czi
+*.tif
+*.rtf
+*.docx
+*.pptx
+*.DS_Store
+*.xml
+*.xsl
+*.db
