@@ -7,6 +7,7 @@ chapter_2/employed_codes/5_analysis_common.ipynb
 chapter_4/employed_codes/3_analysis_filtered.ipynb
 chapter_2/employed_codes/6_analysis_common_filter_6 pc.ipynb
 
+*.pkl
 *.ipynb1
 *.png
 *.jpeg
