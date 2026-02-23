@@ -1,0 +1,29 @@
+{
+  "metric_roots": [
+    "Value_Correlation",
+    "Importance_IoU",
+    "Importance_Correlation",
+    "Value_Hist_Corr",
+    "Spatial_Hist_Corr",
+    "Radial_Corr",
+    "Quadrant_Corr",
+    "Morans_Sim",
+    "GNN_Cosine"
+  ],
+  "weights": {
+    "Value_Correlation": 0.09661316713445176,
+    "Importance_IoU": 0.12049114636006317,
+    "Importance_Correlation": 0.11965821346407976,
+    "Value_Hist_Corr": 0.16523545817383933,
+    "Spatial_Hist_Corr": 0.07755788400647601,
+    "Radial_Corr": 0.17056134977229193,
+    "Quadrant_Corr": 0.12491964474028971,
+    "Morans_Sim": 0.07722936758293675,
+    "GNN_Cosine": 0.047733768765571546
+  },
+  "angle_range": {
+    "min": 354,
+    "max": 6
+  },
+  "accuracy": 0.9633928571428572
+}
