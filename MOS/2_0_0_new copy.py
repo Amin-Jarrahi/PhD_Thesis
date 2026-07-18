@@ -133,23 +133,19 @@ def get_9_metrics(s1: CalibrationSignature, s2: CalibrationSignature) -> dict:
         rats = np.minimum(s1.values[mask], s2.values[mask]) / (np.maximum(s1.values[mask], s2.values[mask]) + 1e-8)
         r_con = 1 / (1 + (np.std(rats) / (np.mean(rats) + 1e-8)))
 
-    mask = (s1.values > 0) | (s2.values > 0)
-    v_corr = 0
-    if mask.sum() > 10:
-        v_corr = max(0, pearsonr(s1.values[mask], s2.values[mask])[0])
-
+    # Primary Metrics
+    v_corr = max(0, pearsonr(s1.values, s2.values)[0])
     p1, p2 = s1.values >= np.percentile(s1.values, 80), s2.values >= np.percentile(s2.values, 80)
     peak = (p1 & p2).sum() / ((p1 | p2).sum() + 1e-8)
 
-    imp1 = s1.importance / (s1.importance.max() + 1e-8)
-    imp2 = s2.importance / (s2.importance.max() + 1e-8)
-    imp_iou = np.minimum(imp1, imp2).sum() / (np.maximum(imp1, imp2).sum() + 1e-8)
+    imp_union = ((s1.importance > 0.5) | (s2.importance > 0.5)).sum()
+    imp_iou = ((s1.importance > 0.5) & (s2.importance > 0.5)).sum() / (imp_union + 1e-8)
     i_corr = max(0, pearsonr(s1.importance, s2.importance)[0])
 
     # Descriptor Metrics
     h_corr = max(0, pearsonr(s1.histogram.flatten(), s2.histogram.flatten())[0])
     val_iou = np.minimum(s1.values, s2.values).sum() / (np.maximum(s1.values, s2.values).sum() + 1e-8)
-    m_sim = max(0, 1 - abs(s1.morans - s2.morans))
+    m_sim = 1 - abs(s1.morans - s2.morans)
 
     def safe_pearsonr(a, b):
         if a.std() > 0 and b.std() > 0:
@@ -251,17 +247,11 @@ class CrossValidatedCalibrator:
             X_test = df[df['sample_id'].isin(test_samples)][ORDERED_FEATURES]
             y_test = df[df['sample_id'].isin(test_samples)]['label']
 
-            model = LogisticRegression(fit_intercept=False, penalty='l2', max_iter=1000)
+            model = LogisticRegression(fit_intercept=False, penalty='l2')
             model.fit(X_train, y_train)
-            """
-            check it again
-            coeffs = (model.coef_[0]) 
 
-            """
-            coeffs = np.abs(model.coef_[0]) 
-
-            total = np.sum(coeffs)
-            normalized_w = coeffs / total if total > 0 else np.ones(len(coeffs)) / len(coeffs)
+            coeffs = np.abs(model.coef_[0])
+            normalized_w = coeffs / np.sum(coeffs)
             fold_weights.append(normalized_w)
 
             y_probs = model.predict_proba(X_test)[:, 1]
@@ -378,7 +368,7 @@ def compute_coordinate_based_similarity(sig1: SpatialSignature, sig2: SpatialSig
     mask = (sig1.raw_values > 0) | (sig2.raw_values > 0)
     value_corr = 0
     if mask.sum() > 10:
-        r, _ = pearsonr(sig1.raw_values[mask], sig2.raw_values[mask])
+        r, _ = pearsonr(sig1.raw_values, sig2.raw_values)
         value_corr = r if not np.isnan(r) else 0
 
     imp_corr = 0
@@ -524,7 +514,7 @@ class MzIsotopeMatcher:
             self._nn_cache[full_key] = indices
         return self._nn_cache[full_key]
 
-    def compute_bio_importance(self, values: np.ndarray, nn_indices: np.ndarray) -> np.ndarray:
+    def compute_bio_importance(self, coords: np.ndarray, values: np.ndarray, k: int, nn_indices: np.ndarray) -> np.ndarray:
         neighbor_vals = values[nn_indices[:, 1:]]
         local_var = np.var(neighbor_vals, axis=1)
         lv_min, lv_max = local_var.min(), local_var.max()
@@ -541,7 +531,7 @@ class MzIsotopeMatcher:
 
     def extract_signature(self, coords: np.ndarray, values: np.ndarray, sample_id: str,
                           feature_name: str, n_neighbors: int, nn_indices: np.ndarray) -> SpatialSignature:
-        bio_imp = self.compute_bio_importance(values, nn_indices)
+        bio_imp = self.compute_bio_importance(coords, values, n_neighbors, nn_indices)
         return SpatialSignature(
             sample_id=sample_id, feature_name=feature_name, feature_type='mz',
             node_importance=bio_imp,
