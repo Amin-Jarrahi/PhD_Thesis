@@ -209,7 +209,18 @@ class CrossValidatedCalibrator:
 
     def run(self):
         """
-        Run calibration and return the learned weights as a dict.
+       Run calibration and return the learned weights as a dict.
+
+        Approach: Logistic Regression with ReLU rectification
+        -----------------------------------------------------
+        1. Fit L2-regularized logistic regression (no intercept).
+        2. Rectify coefficients: w_i = max(0, coef_i).
+           - Negative coefficients arise from collinearity, not true inverse
+             relationships, because all 9 metrics are designed so higher = more
+             co-localized. Zeroing them is the correct response.
+        3. Normalize to sum to 1 → valid convex-combination weights.
+        4. Evaluate AUC using the SAME rectified weights (no disconnect).
+
         Returns:
             dict mapping metric name → calibrated weight (sums to 1.0)
         """
@@ -241,46 +252,83 @@ class CrossValidatedCalibrator:
         kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
         fold_aucs = []
         fold_weights = []
+        fold_n_active = []
+        fold_n_rectified = []
 
-        for train_idx, test_idx in kf.split(samples):
+        n_features = len(ORDERED_FEATURES)
+
+
+        for fold_i, (train_idx, test_idx) in enumerate(kf.split(samples)):
             train_samples = samples[train_idx]
-            test_samples = samples[test_idx]
+            test_samples  = samples[test_idx]
 
-            X_train = df[df['sample_id'].isin(train_samples)][ORDERED_FEATURES]
-            y_train = df[df['sample_id'].isin(train_samples)]['label']
-            X_test = df[df['sample_id'].isin(test_samples)][ORDERED_FEATURES]
-            y_test = df[df['sample_id'].isin(test_samples)]['label']
+            X_train = df[df['sample_id'].isin(train_samples)][ORDERED_FEATURES].values
+            y_train = df[df['sample_id'].isin(train_samples)]['label'].values.astype(float)
+            X_test  = df[df['sample_id'].isin(test_samples)][ORDERED_FEATURES].values
+            y_test  = df[df['sample_id'].isin(test_samples)]['label'].values.astype(float)
 
+            # Step 1: Fit logistic regression (no intercept, L2 penalty)
             model = LogisticRegression(fit_intercept=False, penalty='l2', max_iter=1000)
             model.fit(X_train, y_train)
-            
-            coeffs = model.coef_[0]
+            raw_coeffs = model.coef_[0].copy()
 
-            total = np.sum(coeffs)
-            normalized_w = coeffs / total if total > 0 else np.ones(len(coeffs)) / len(coeffs)
+            # Step 2: Rectify — zero out negative coefficients
+            rectified = np.maximum(0.0, raw_coeffs)
+            n_neg = int((raw_coeffs < 0).sum())
+            fold_n_rectified.append(n_neg)
+
+            # Step 3: Normalize to sum to 1
+            total = rectified.sum()
+            if total > 0:
+                normalized_w = rectified / total
+            else:
+                # Fallback: all coefficients were negative (extremely unlikely)
+                print(f"  ⚠ Fold {fold_i+1}: all coefficients negative, using uniform weights")
+                normalized_w = np.ones(n_features) / n_features
+
             fold_weights.append(normalized_w)
+            fold_n_active.append(int((normalized_w > 0).sum()))
 
-            y_probs = model.predict_proba(X_test)[:, 1]
+            # Step 4: Evaluate AUC using the SAME rectified+normalized weights
+            #   Score = X @ w  (weighted sum of metrics, all in [0,1])
+            #   Convert to probability via sigmoid for AUC computation
+            logits = X_test @ normalized_w
+            y_probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -30, 30)))
             fold_aucs.append(roc_auc_score(y_test, y_probs))
 
         avg_weights = np.mean(fold_weights, axis=0)
         std_weights = np.std(fold_weights, axis=0)
-        avg_auc = np.mean(fold_aucs)
+        avg_auc     = np.mean(fold_aucs)
 
-        self.print_thesis_report(ORDERED_FEATURES, avg_weights, std_weights, avg_auc)
+        self.print_report(
+            ORDERED_FEATURES, avg_weights, std_weights, avg_auc,
+            fold_n_active, fold_n_rectified
+        )
 
-        # Return calibrated weights as a dictionary
-        calibrated_weights = {name: float(w) for name, w in zip(ORDERED_FEATURES, avg_weights)}
+        calibrated_weights = {
+            name: float(w) for name, w in zip(ORDERED_FEATURES, avg_weights)
+        }
         return calibrated_weights
 
-    def print_thesis_report(self, names, avg_w, std_w, auc):
+    def print_report(self, names, avg_w, std_w, auc,
+                            fold_n_active=None, fold_n_rectified=None):
         se_w = std_w / np.sqrt(N_FOLDS)
 
         print("\n" + "=" * 95)
-        print("PHD THESIS CALIBRATION REPORT: ROBUST SPATIAL WEIGHTS")
+        print("CALIBRATION REPORT: ROBUST SPATIAL WEIGHTS")
         print("=" * 95)
         print(f"{N_FOLDS}-Fold Cross-Validated AUC: {auc:.4f}")
-        print("\nValidated Weights (Fractional Mean [0-1] +/- SD and SE):")
+
+        if fold_n_rectified is not None:
+            mean_rect = np.mean(fold_n_rectified)
+            print(f"Negative coefficients rectified per fold: "
+                  f"{fold_n_rectified}  (mean: {mean_rect:.1f}/{len(names)})")
+        if fold_n_active is not None:
+            mean_active = np.mean(fold_n_active)
+            print(f"Active metrics (weight > 0) per fold:     "
+                  f"{fold_n_active}  (mean: {mean_active:.1f}/{len(names)})")
+
+        print(f"\nValidated Weights (Fractional Mean [0-1] ± SD and SE):")
         print("-" * 95)
         print(f"{'Metric Name':<35} | {'Weight (0-1)':<14} | {'SD':<10} | {'Std. Error (SE)':<15}")
         print("-" * 95)
@@ -289,8 +337,10 @@ class CrossValidatedCalibrator:
         print("-" * 95)
         print(f"{'TOTAL (Sum)':<35} | {np.sum(avg_w):>12.4f}   |")
         print("=" * 95)
-        print(f"Justification: Standard Error (SE) represents the precision of the weight estimate across")
-        print(f"all {N_FOLDS} folds. Low SE indicates high confidence in the global weight distribution.")
+        print(f"Justification: Logistic regression coefficients rectified (ReLU) to enforce")
+        print(f"non-negativity, then normalized to sum to 1. Negative coefficients arise from")
+        print(f"collinearity, not true inverse relationships, as all metrics are designed so")
+        print(f"higher = more co-localized. AUC evaluated with the same rectified weights.")
         print("=" * 95)
 
 
