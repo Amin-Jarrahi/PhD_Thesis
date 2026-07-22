@@ -1,24 +1,22 @@
 """
 Gene-to-m/z Rotation Analysis - OPTIMIZED VERSION
-========================================================
+==================================================
 """
 import numpy as np
 import scanpy as sc
 from sklearn.neighbors import NearestNeighbors
 from scipy.stats import pearsonr
-from scipy.interpolate import griddata, LinearNDInterpolator  
-from scipy.spatial import Delaunay  
+from scipy.interpolate import griddata
 import pandas as pd
 import os
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 from functools import lru_cache
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
 import functools
-import time 
 
 warnings.filterwarnings('ignore')
 
@@ -159,6 +157,14 @@ def rotate_coords_batch(coords: np.ndarray, angles_degrees: np.ndarray) -> Dict[
     
     return rotated
 
+'''
+def align_bounds(source_coords: np.ndarray, target_coords: np.ndarray) -> np.ndarray:
+    """Vectorized bounds alignment."""
+    s_min, s_max = source_coords.min(axis=0), source_coords.max(axis=0)
+    t_min, t_max = target_coords.min(axis=0), target_coords.max(axis=0)
+    scale = (t_max - t_min) / (s_max - s_min + 1e-8)
+    return (source_coords - s_min) * scale + t_min
+'''
 
 def align_bounds(source_coords: np.ndarray, target_coords: np.ndarray) -> np.ndarray:
     """Vectorized bounds alignment."""
@@ -166,11 +172,12 @@ def align_bounds(source_coords: np.ndarray, target_coords: np.ndarray) -> np.nda
     t_min, t_max = target_coords.min(axis=0), target_coords.max(axis=0)
     s_range = s_max - s_min + 1e-8
     t_range = t_max - t_min
-    # uniform isotropic scale preserves aspect ratio and all distance-based metrics
-    scale = min(t_range[0] / s_range[0], t_range[1] / s_range[1])  
-    t_center = (t_min + t_max) / 2  
-    s_centered = source_coords - (s_min + s_max) / 2  
-    return s_centered * scale + t_center  
+    # ◆ FIX 2: Was: scale = t_range / s_range (independent x/y scaling, distorts geometry)
+    #   Now: uniform isotropic scale preserves aspect ratio and all distance-based metrics
+    scale = min(t_range[0] / s_range[0], t_range[1] / s_range[1])  # ◆ FIX 2
+    t_center = (t_min + t_max) / 2  # ◆ FIX 2: center the result in the target bbox
+    s_centered = source_coords - (s_min + s_max) / 2  # ◆ FIX 2
+    return s_centered * scale + t_center  # ◆ FIX 2
 
 
 def compute_value_histogram_fast(values: np.ndarray, n_bins: int = 50) -> np.ndarray:
@@ -253,6 +260,34 @@ def compute_quadrant_stats_fast(coords: np.ndarray, values: np.ndarray, n_div: i
     return stats
 
 
+def compute_morans_i_fast(values: np.ndarray, nn_indices: np.ndarray) -> float:
+    """
+    Fast Moran's I using precomputed kNN indices.
+    Assumes nn_indices includes self as first column.
+    """
+    n = len(values)
+    mean_v = values.mean()
+    dev = values - mean_v
+
+    denom = np.dot(dev, dev)
+    if denom == 0:
+        return 0.0
+
+    # Neighbor deviations (exclude self)
+    neighbor_devs = dev[nn_indices[:, 1:]]
+
+    # Vectorized numerator
+    numer = np.sum(dev[:, None] * neighbor_devs)
+
+    # Total weight (exact count of edges)
+    w_sum = neighbor_devs.size
+
+    if w_sum == 0:
+        return 0.0
+
+    return (n / w_sum) * (numer / denom)
+
+
 def compute_node_importance_fast(values: np.ndarray, nn_indices: np.ndarray) -> np.ndarray:
     neighbor_vals = values[nn_indices[:, 1:]]
     loc_var = np.var(neighbor_vals, axis=1)
@@ -286,6 +321,7 @@ class SpatialSignature:
     spatial_histogram: np.ndarray
     radial_profile: np.ndarray
     quadrant_stats: np.ndarray
+    morans_i: float
     coordinates: np.ndarray
     raw_values: np.ndarray
     aligned_coordinates: Optional[np.ndarray] = None
@@ -315,120 +351,59 @@ def fast_pearsonr(a: np.ndarray, b: np.ndarray) -> float:
     return numer / denom
 
 
-# Vectorized Pearson correlation — one gene descriptor vs ALL m/z descriptors at once
-def fast_pearsonr_batch(gene_vec: np.ndarray, mz_matrix: np.ndarray) -> np.ndarray:
-    """
-    Compute Pearson correlation between one gene vector and each row
-    of mz_matrix (n_mz × len) in a single vectorized operation.
-    Returns array of shape (n_mz,).
-    """
-    g = gene_vec.flatten().astype(np.float64)
-    M = mz_matrix.astype(np.float64)  # (n_mz, D)
-
-    g_c = g - g.mean()
-    M_c = M - M.mean(axis=1, keepdims=True)
-
-    g_norm = np.sqrt(np.dot(g_c, g_c))
-    M_norms = np.sqrt(np.sum(M_c ** 2, axis=1))
-
-    denom = g_norm * M_norms
-    # Avoid division by zero
-    safe = denom > 0
-    result = np.zeros(M.shape[0])
-    if g_norm > 0:
-        dots = M_c @ g_c  # (n_mz,)
-        result[safe] = dots[safe] / denom[safe]
-
-    return result
-
-
-# Replaced per-m/z Python loop with fully vectorized scoring
-def compute_all_scores_vectorized(
+def compute_all_scores_fast(
     gene_coords: np.ndarray,
     gene_values: np.ndarray,
     gene_importance: np.ndarray,
     gene_descriptors: Dict[str, np.ndarray],
+    mz_sig: SpatialSignature,
+    mz_grid_cache: Dict[str, np.ndarray],
     grid_x: np.ndarray,
-    grid_y: np.ndarray,
-    mz_names: List[str],
-    mz_grid_values_stack: np.ndarray,     # (n_mz, grid_res, grid_res)
-    mz_grid_importance_stack: np.ndarray,  # (n_mz, grid_res, grid_res)
-    mz_value_hist_stack: np.ndarray,       # (n_mz, n_bins)
-    mz_spatial_hist_stack: np.ndarray,     # (n_mz, n_bins*n_bins)
-    mz_radial_stack: np.ndarray,           # (n_mz, n_rings)
-    mz_quadrant_stack: np.ndarray,         # (n_mz, n_div*n_div*2)
-    gene_interp_func                        # reusable interpolator
-) -> Dict[str, Dict[str, object]]:
+    grid_y: np.ndarray
+) -> Dict[str, float]:
     """
-    Compute scores for ONE gene against ALL m/z features at once
-    using matrix operations instead of a Python loop over m/z.
+    Optimized score computation using pre-computed MSI grids.
     """
-    n_mz = len(mz_names)
-    grid_pts = np.column_stack([grid_x.ravel(), grid_y.ravel()])
-
-    # Use prebuilt interpolator instead of calling griddata each time
-    g_grid_flat = gene_interp_func(grid_pts)
-    g_grid = g_grid_flat.reshape(grid_x.shape)
-
-    g_imp_interp = LinearNDInterpolator(
-        Delaunay(gene_coords), gene_importance, fill_value=np.nan
-    )
-    g_imp_grid = g_imp_interp(grid_pts).reshape(grid_x.shape)
-
-    # --- Value Correlation: gene grid vs each m/z grid ---
-    g_flat = g_grid.ravel()
-    g_imp_flat = g_imp_grid.ravel()
-
-    val_corrs = np.zeros(n_mz)
-    iou_scores = np.zeros(n_mz)
-    imp_corrs = np.zeros(n_mz)
-
-    g_nan_mask = np.isnan(g_flat)
-    g_imp_nan_mask = np.isnan(g_imp_flat)
-
-    for i in range(n_mz):
-        m_flat = mz_grid_values_stack[i].ravel()
-        mask = ~(g_nan_mask | np.isnan(m_flat))
-        if mask.sum() > 10:
-            val_corrs[i] = fast_pearsonr(g_flat[mask], m_flat[mask])
-
-        m_imp_flat = mz_grid_importance_stack[i].ravel()
-        mask_imp = ~(g_imp_nan_mask | np.isnan(m_imp_flat))
-        if mask_imp.sum() > 0:
-            gi = np.nan_to_num(g_imp_flat[mask_imp], 0.0)
-            mi = np.nan_to_num(m_imp_flat[mask_imp], 0.0)
-            gi_max = gi.max()
-            mi_max = mi.max()
-            if gi_max > 0:
-                gi = gi / gi_max
-            if mi_max > 0:
-                mi = mi / mi_max
-            iou_scores[i] = np.minimum(gi, mi).sum() / (np.maximum(gi, mi).sum() + 1e-8)
-            imp_corrs[i] = fast_pearsonr(gi, mi)
-
-    # Descriptor correlations — batch across all m/z at once
-    vhist_corrs = fast_pearsonr_batch(gene_descriptors['value_hist'], mz_value_hist_stack)
-    shist_corrs = fast_pearsonr_batch(gene_descriptors['spatial_hist'], mz_spatial_hist_stack)
-    radial_corrs = fast_pearsonr_batch(gene_descriptors['radial'], mz_radial_stack)
-    quad_corrs = fast_pearsonr_batch(gene_descriptors['quadrant'], mz_quadrant_stack)
-
-    # --- Find best m/z per metric ---
-    metric_arrays = {
-        'Value_Correlation': val_corrs,
-        'Importance_IoU': iou_scores,
-        'Importance_Correlation': imp_corrs,
-        'Value_Hist_Corr': vhist_corrs,
-        'Spatial_Hist_Corr': shist_corrs,
-        'Radial_Corr': radial_corrs,
-        'Quadrant_Corr': quad_corrs
-    }
-
-    best_per_metric = {}
-    for k, arr in metric_arrays.items():
-        idx = np.argmax(arr)
-        best_per_metric[k] = {'mz': mz_names[idx], 'score': arr[idx]}
-
-    return best_per_metric
+    scores = {}
+    
+    # Interpolate gene data onto the common grid
+    g_grid = griddata(gene_coords, gene_values, (grid_x, grid_y), method='linear')
+    g_imp_grid = griddata(gene_coords, gene_importance, (grid_x, grid_y), method='linear')
+    
+    # Get cached MSI grids
+    m_grid = mz_grid_cache['values']
+    m_imp_grid = mz_grid_cache['importance']
+    
+    # Value correlation
+    mask = ~(np.isnan(g_grid) | np.isnan(m_grid))
+    if mask.sum() > 10:
+        scores['Value_Correlation'] = fast_pearsonr(g_grid[mask], m_grid[mask])
+    else:
+        scores['Value_Correlation'] = 0.0
+    
+    # Importance metrics
+    mask_imp = ~(np.isnan(g_imp_grid) | np.isnan(m_imp_grid))
+    if mask_imp.sum() > 0:
+        gi = np.nan_to_num(g_imp_grid, 0)
+        mi = np.nan_to_num(m_imp_grid, 0)
+        gi = gi / (gi.max() + 1e-8)
+        mi = mi / (mi.max() + 1e-8)
+        
+        scores['Importance_IoU'] = (np.minimum(gi[mask_imp], mi[mask_imp]).sum() / 
+                                    (np.maximum(gi[mask_imp], mi[mask_imp]).sum() + 1e-8))
+        scores['Importance_Correlation'] = fast_pearsonr(gi[mask_imp], mi[mask_imp])
+    else:
+        scores['Importance_IoU'] = 0.0
+        scores['Importance_Correlation'] = 0.0
+    
+    # Descriptor correlations (using pre-computed gene descriptors)
+    scores['Value_Hist_Corr'] = fast_pearsonr(gene_descriptors['value_hist'], mz_sig.value_histogram)
+    scores['Spatial_Hist_Corr'] = fast_pearsonr(gene_descriptors['spatial_hist'], mz_sig.spatial_histogram)
+    scores['Radial_Corr'] = fast_pearsonr(gene_descriptors['radial'], mz_sig.radial_profile)
+    scores['Quadrant_Corr'] = fast_pearsonr(gene_descriptors['quadrant'], mz_sig.quadrant_stats)
+    scores['Morans_Sim'] = max(0.0, 1.0 - abs(gene_descriptors['morans_i'] - mz_sig.morans_i)) 
+    
+    return scores
 
 
 # =============================================================================
@@ -450,20 +425,6 @@ class OptimizedRotationAnalyzer:
         self.rna_nn_indices: Dict[str, np.ndarray] = {}
         self.common_grids: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}  # sample -> (grid_x, grid_y)
         
-        # Stacked m/z descriptor arrays for vectorized correlation
-        self.msi_grid_values_stack: Dict[str, np.ndarray] = {}
-        self.msi_grid_importance_stack: Dict[str, np.ndarray] = {}
-        self.msi_value_hist_stack: Dict[str, np.ndarray] = {}
-        self.msi_spatial_hist_stack: Dict[str, np.ndarray] = {}
-        self.msi_radial_stack: Dict[str, np.ndarray] = {}
-        self.msi_quadrant_stack: Dict[str, np.ndarray] = {}
-        self.msi_mz_names: Dict[str, List[str]] = {}
-
-        # Cached dense RNA matrices and gene index maps
-        self.rna_dense: Dict[str, np.ndarray] = {}
-        self.rna_gene_idx: Dict[str, Dict[str, int]] = {}
-        self.rna_coords: Dict[str, np.ndarray] = {}
-
         self.grid_res = 50
 
     def load_data(self):
@@ -495,19 +456,6 @@ class OptimizedRotationAnalyzer:
             else:
                 print(f"  Missing file: {f}")
         print(f"Successfully loaded {loaded_msi}/{len(MSI_SAMPLE_IDS)} MSI files.")
-
-        # Pre-densify RNA matrices and build gene index maps once
-        print("\n  Pre-densifying RNA matrices...")
-        for s, adata in self.rna.items():
-            if hasattr(adata.X, 'toarray'):
-                self.rna_dense[s] = adata.X.toarray()
-            else:
-                self.rna_dense[s] = np.array(adata.X)
-            self.rna_gene_idx[s] = {g: i for i, g in enumerate(adata.var_names)}
-            self.rna_coords[s] = np.column_stack([
-                adata.obs['x_um'].values, adata.obs['y_um'].values
-            ])
-        print("  Done.")
 
     def precompute_msi_signatures(self):
         """
@@ -548,14 +496,6 @@ class OptimizedRotationAnalyzer:
             
             self.msi_signatures[sample_id] = {}
             self.msi_grids[sample_id] = {}
-
-            # Collect per-mz arrays into lists, then stack
-            grid_val_list = []
-            grid_imp_list = []
-            vhist_list = []
-            shist_list = []
-            radial_list = []
-            quad_list = []
             
             for i, mz_name in enumerate(mz_names):
                 vals = m_vals_all[:, i]
@@ -563,20 +503,16 @@ class OptimizedRotationAnalyzer:
                 # Compute signature
                 importance = compute_node_importance_fast(vals, nn_indices)
                 
-                vhist = compute_value_histogram_fast(vals)
-                shist = compute_spatial_histogram_fast(m_coords, vals)
-                radial = compute_radial_profile_fast(m_coords, vals)
-                quadrant = compute_quadrant_stats_fast(m_coords, vals)
-                
                 sig = SpatialSignature(
                     sample_id=sample_id,
                     feature_name=mz_name,
                     feature_type='mz',
                     node_importance=importance,
-                    value_histogram=vhist,
-                    spatial_histogram=shist,
-                    radial_profile=radial,
-                    quadrant_stats=quadrant,
+                    value_histogram=compute_value_histogram_fast(vals),
+                    spatial_histogram=compute_spatial_histogram_fast(m_coords, vals),
+                    radial_profile=compute_radial_profile_fast(m_coords, vals),
+                    quadrant_stats=compute_quadrant_stats_fast(m_coords, vals),
+                    morans_i=compute_morans_i_fast(vals, nn_indices),
                     coordinates=m_coords,
                     raw_values=vals
                 )
@@ -584,31 +520,12 @@ class OptimizedRotationAnalyzer:
                 self.msi_signatures[sample_id][mz_name] = sig
                 
                 # Pre-compute grids for fast interpolation later
-                gv = griddata(m_coords, vals, (gx, gy), method='linear')
-                gi = griddata(m_coords, importance, (gx, gy), method='linear')
                 self.msi_grids[sample_id][mz_name] = {
-                    'values': gv,
-                    'importance': gi
+                    'values': griddata(m_coords, vals, (gx, gy), method='linear'),
+                    'importance': griddata(m_coords, importance, (gx, gy), method='linear')
                 }
-
-                # Accumulate for stacking
-                grid_val_list.append(gv)
-                grid_imp_list.append(gi)
-                vhist_list.append(vhist)
-                shist_list.append(shist)
-                radial_list.append(radial)
-                quad_list.append(quadrant)
-
-            # Stack all m/z descriptors into arrays for vectorized ops
-            self.msi_mz_names[sample_id] = mz_names
-            self.msi_grid_values_stack[sample_id] = np.array(grid_val_list)      # (n_mz, grid_res, grid_res)
-            self.msi_grid_importance_stack[sample_id] = np.array(grid_imp_list)
-            self.msi_value_hist_stack[sample_id] = np.array(vhist_list)
-            self.msi_spatial_hist_stack[sample_id] = np.array(shist_list)
-            self.msi_radial_stack[sample_id] = np.array(radial_list)
-            self.msi_quadrant_stack[sample_id] = np.array(quad_list)
             
-            print(f"    Cached {len(mz_names)} m/z signatures (stacked for vectorized scoring)")
+            print(f"    Cached {len(mz_names)} m/z signatures")
         
         print("MSI pre-computation complete!")
 
@@ -620,7 +537,10 @@ class OptimizedRotationAnalyzer:
         for sample_id, r_adata in self.rna.items():
             print(f"  Processing RNA sample: {sample_id}")
             
-            r_coords = self.rna_coords[sample_id]  # use cached coords
+            r_coords = np.column_stack([
+                r_adata.obs['x_um'].values,
+                r_adata.obs['y_um'].values
+            ])
             
             # ---- NORMALIZE COORDINATES HERE ----
             coord_min = r_coords.min(axis=0)
@@ -628,7 +548,7 @@ class OptimizedRotationAnalyzer:
             norm_coords = (r_coords - coord_min) / coord_range
             
             # ---- BUILD kNN ON NORMALIZED SPACE ----
-            k = 6  # or whatever you use
+            k = 7  # or whatever you use
             nn = NearestNeighbors(n_neighbors=k + 1)
             nn.fit(norm_coords)
             _, nn_indices = nn.kneighbors(norm_coords)
@@ -643,16 +563,18 @@ class OptimizedRotationAnalyzer:
         angle: int,
         gene: str,
         sample_id: str,
+        metric_keys: List[str]
     ) -> Optional[Dict]:
         """Process a single (angle, gene, sample) combination."""
         
         if sample_id not in self.msi:
             return None
         
-        # Use cached dense matrix and index map 
-        r_coords = self.rna_coords[sample_id]
-        g_idx = self.rna_gene_idx[sample_id][gene]
-        g_vals = self.rna_dense[sample_id][:, g_idx]
+        r_adata = self.rna[sample_id]
+        r_coords = np.column_stack([r_adata.obs['x_um'].values, r_adata.obs['y_um'].values])
+        
+        g_idx = list(r_adata.var_names).index(gene)
+        g_vals = r_adata.X[:, g_idx].toarray().flatten() if hasattr(r_adata.X, 'toarray') else r_adata.X[:, g_idx].flatten()
         
         # Rotate coordinates
         theta = np.radians(angle)
@@ -663,7 +585,7 @@ class OptimizedRotationAnalyzer:
         rot_coords = (centered @ rotation_matrix.T) + center
         
         # Align to MSI bounds
-        m_coords = self.msi_signatures[sample_id][self.msi_mz_names[sample_id][0]].coordinates  # direct list access
+        m_coords = self.msi_signatures[sample_id][list(self.msi_signatures[sample_id].keys())[0]].coordinates
         aligned = align_bounds(rot_coords, m_coords)
         
         # Compute gene importance (using original coords for NN structure)
@@ -676,40 +598,30 @@ class OptimizedRotationAnalyzer:
             'spatial_hist': compute_spatial_histogram_fast(aligned, g_vals),
             'radial': compute_radial_profile_fast(aligned, g_vals),
             'quadrant': compute_quadrant_stats_fast(aligned, g_vals),
+            'morans_i': compute_morans_i_fast(g_vals, nn_indices)
         }
         
         # Get common grid
         grid_x, grid_y = self.common_grids[sample_id]
-
-        # Build a reusable LinearNDInterpolator for gene values
-        #   (replaces two separate griddata calls inside the scoring function)
-        try:
-            tri = Delaunay(aligned)
-            gene_interp = LinearNDInterpolator(tri, g_vals, fill_value=np.nan)
-        except Exception:
-            # Fallback if Delaunay fails (degenerate point set)
-            gene_interp = lambda pts: griddata(aligned, g_vals, pts, method='linear')
-
-        # Call vectorized scoring — processes ALL m/z at once
-        best_per_metric = compute_all_scores_vectorized(
-            gene_coords=aligned,
-            gene_values=g_vals,
-            gene_importance=importance,
-            gene_descriptors=gene_descriptors,
-            grid_x=grid_x,
-            grid_y=grid_y,
-            mz_names=self.msi_mz_names[sample_id],
-            mz_grid_values_stack=self.msi_grid_values_stack[sample_id],
-            mz_grid_importance_stack=self.msi_grid_importance_stack[sample_id],
-            mz_value_hist_stack=self.msi_value_hist_stack[sample_id],
-            mz_spatial_hist_stack=self.msi_spatial_hist_stack[sample_id],
-            mz_radial_stack=self.msi_radial_stack[sample_id],
-            mz_quadrant_stack=self.msi_quadrant_stack[sample_id],
-            gene_interp_func=gene_interp
-        )
+        
+        # Find best m/z for each metric
+        best_per_metric = {k: {'mz': None, 'score': -np.inf} for k in metric_keys}
+        
+        for mz_name, mz_sig in self.msi_signatures[sample_id].items():
+            mz_grids = self.msi_grids[sample_id][mz_name]
+            
+            scores = compute_all_scores_fast(
+                aligned, g_vals, importance,
+                gene_descriptors, mz_sig, mz_grids,
+                grid_x, grid_y
+            )
+            
+            for k in metric_keys:
+                if scores[k] > best_per_metric[k]['score']:
+                    best_per_metric[k]['score'] = scores[k]
+                    best_per_metric[k]['mz'] = mz_name
         
         # Build result row
-        metric_keys = list(best_per_metric.keys())
         row = {
             'Rotation_Angle': angle,
             'Gene': gene,
@@ -720,6 +632,11 @@ class OptimizedRotationAnalyzer:
             row[f'Max_{k}'] = best_per_metric[k]['score']
         
         return row
+
+    def _process_item_wrapper(self, item, metric_keys):
+        """Wrapper to unpack tuple for executor.map"""
+        angle, gene, sample_id = item
+        return self.process_angle_gene_sample(angle, gene, sample_id, metric_keys)
 
     def run(self):
         print("\n=== STARTING OPTIMIZED ROTATION ANALYSIS ===")
@@ -745,6 +662,12 @@ class OptimizedRotationAnalyzer:
             print("!!! STOPPING: None of the target genes were found in the loaded data.")
             return
         
+        metric_keys = [
+            'Value_Correlation', 'Importance_IoU', 'Importance_Correlation',
+            'Value_Hist_Corr', 'Spatial_Hist_Corr', 'Radial_Corr',
+            'Quadrant_Corr', 'Morans_Sim'
+        ]
+        
         # Build angles list
         if ANGLE_START <= ANGLE_END:
             angles = list(range(ANGLE_START, ANGLE_END + ANGLE_STEP, ANGLE_STEP))
@@ -762,20 +685,28 @@ class OptimizedRotationAnalyzer:
                         work_items.append((angle, gene, sample_id))
         
         print(f"\nTotal work items: {len(work_items)}")
-
+        print(f"Using {self.n_workers} workers for parallel processing")
+        
+        # Process in parallel
         results = []
         
         for angle in angles:
-            t0 = time.time()  # timing per angle
+            print(f"Processing Angle {angle}°...")
             angle_items = [(a, g, s) for a, g, s in work_items if a == angle]
             
-            for a, g, s in angle_items:
-                r = self.process_angle_gene_sample(a, g, s)
-                if r is not None:
-                    results.append(r)
-
-            dt = time.time() - t0
-            print(f"  Angle {angle:3d}°  —  {len(angle_items)} items in {dt:.1f}s")
+            # Use ThreadPoolExecutor for parallel processing
+            with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
+                # Create partial function with fixed metric_keys
+                process_fn = functools.partial(
+                    self._process_item_wrapper,
+                    metric_keys=metric_keys
+                )
+                
+                # Process in parallel
+                batch_results = list(executor.map(process_fn, angle_items))
+            
+            # Filter out None results
+            results.extend([r for r in batch_results if r is not None])
         
         if results:
             df = pd.DataFrame(results)

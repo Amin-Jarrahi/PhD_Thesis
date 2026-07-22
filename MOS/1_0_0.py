@@ -1,0 +1,712 @@
+"""
+Gene-to-m/z Spatial Pattern Matching Pipeline — OPTIMIZED VERSION
+=======================================================================
+"""
+
+import numpy as np
+import scanpy as sc
+from sklearn.neighbors import NearestNeighbors
+from scipy.stats import pearsonr
+from scipy.interpolate import griddata, LinearNDInterpolator  
+from scipy.spatial import Delaunay  # for reusable triangulation
+import matplotlib.pyplot as plt
+from typing import Dict, Optional
+import pandas as pd
+import os
+import json
+import warnings
+from dataclasses import dataclass
+import pickle
+from joblib import Parallel, delayed
+import time  # for timing
+
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# DATA CONFIGURATION
+# =============================================================================
+
+RNA_PIXEL_SIZE = 55  # μm (Visium)
+MSI_PIXEL_SIZE = 60  # μm
+TOP_K_MATCHES = 26
+RNA_ROTATION_ANGLE = 180.0 # degrees (for aligning RNA to MSI)
+
+MSI_INPUT_FOLDER = "/home/ajarrah/PhD_Thesis/chapter_2/h5ad_data_processed_4lockmasses_filtered_halfbrain_common_synced/"
+MSI_SAMPLE_FILES = [
+    "halfbrain_yc_1_filtered_common_synced.h5ad", "halfbrain_yc_2_filtered_common_synced.h5ad",
+    "halfbrain_yc_3_filtered_common_synced.h5ad", "halfbrain_yc_4_filtered_common_synced.h5ad",
+    "halfbrain_yad_1_filtered_common_synced.h5ad", "halfbrain_yad_2_filtered_common_synced.h5ad",
+    "halfbrain_yad_3_filtered_common_synced.h5ad", "halfbrain_yad_4_filtered_common_synced.h5ad",
+    "halfbrain_ac_1_filtered_common_synced.h5ad", "halfbrain_ac_2_filtered_common_synced.h5ad",
+    "halfbrain_ac_3_filtered_common_synced.h5ad", "halfbrain_ac_4_filtered_common_synced.h5ad",
+    "halfbrain_aad_1_filtered_common_synced.h5ad", "halfbrain_aad_2_filtered_common_synced.h5ad",
+    "halfbrain_aad_3_filtered_common_synced.h5ad", "halfbrain_aad_4_filtered_common_synced.h5ad"
+]
+MSI_SAMPLE_IDS = [
+    "YC_1", "YC_2", "YC_3", "YC_4",
+    "YAD_1", "YAD_2", "YAD_3", "YAD_4",
+    "AC_1", "AC_2", "AC_3", "AC_4",
+    "AAD_1", "AAD_2", "AAD_3", "AAD_4"
+]
+
+RNA_INPUT_FOLDER = "/home/ajarrah/PhD_Thesis/chapter_4/h5ad_data/genes_top_800/"
+RNA_SAMPLE_FILES = [
+    "YC_1.h5ad", "YC_2.h5ad", "YC_3.h5ad", "YC_4.h5ad",
+    "YAD_1.h5ad", "YAD_2.h5ad", "YAD_3.h5ad", "YAD_4.h5ad",
+    "AC_1.h5ad", "AC_2.h5ad", "AC_3.h5ad", "AC_4.h5ad",
+    "AAD_1.h5ad", "AAD_2.h5ad", "AAD_3.h5ad", "AAD_4.h5ad"
+]
+RNA_SAMPLE_IDS = [
+    "YC_1", "YC_2", "YC_3", "YC_4",
+    "YAD_1", "YAD_2", "YAD_3", "YAD_4",
+    "AC_1", "AC_2", "AC_3", "AC_4",
+    "AAD_1", "AAD_2", "AAD_3", "AAD_4"
+]
+
+
+AAD_TARGET_GENES = ['Eno1', 'Mapt', 'Thy1', 'Pmch', 'Atp1a3', 'Rac1', 'Rsrp1', 'Snhg11', 'Tubb4a',
+   'Rasgrf1', 'Hsp90ab1', 'Elavl3', 'App', 'Syp', 'AC149090.1',
+   'Aplp1', 'Apoe', 'Meg3', 'Gnas', 'Pkm']
+
+
+# Path to the weights JSON produced by 0_2_0_new.py's optimize_weights() /
+# save_weights(). If this file exists it is loaded and used instead of
+# DEFAULT_WEIGHTS below.
+WEIGHTS_FILE_PATH = "/home/ajarrah/PhD_Thesis/rotation_analysis_optimized_50_340_20_2/optimized_weights.json"
+
+
+# Fallback weights, used only if WEIGHTS_FILE_PATH doesn't exist / can't be loaded.
+DEFAULT_WEIGHTS = {
+    'value_correlation': 0.1,
+    'importance_iou': 0.1,
+    'importance_correlation': 0.1,
+    'spatial_hist_corr': 0.2,
+    'radial_corr': 0.2,
+    'quadrant_corr': 0.1,
+    'value_hist_corr': 0.2,
+}
+ 
+ 
+def load_weights(weights_file_path: str = WEIGHTS_FILE_PATH, fallback: dict = None) -> dict:
+    """Load optimized metric weights from the JSON file produced by
+    0_2_0_new.py. Falls back to DEFAULT_WEIGHTS if the file is missing,
+    unreadable, or doesn't contain all required keys."""
+    if fallback is None:
+        fallback = DEFAULT_WEIGHTS
+ 
+    required_keys = set(fallback.keys())
+ 
+    if weights_file_path and os.path.exists(weights_file_path):
+        try:
+            with open(weights_file_path, "r") as f:
+                loaded = json.load(f)
+            if required_keys.issubset(loaded.keys()):
+                print(f"Loaded optimized weights from: {weights_file_path}")
+                return {k: float(loaded[k]) for k in required_keys}
+            else:
+                missing = required_keys - loaded.keys()
+                print(f"Weights file missing keys {missing}; using DEFAULT_WEIGHTS.")
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Could not load weights from {weights_file_path} ({e}); using DEFAULT_WEIGHTS.")
+    else:
+        print(f"No weights file found at {weights_file_path}; using DEFAULT_WEIGHTS.")
+ 
+    return dict(fallback)
+ 
+ 
+# Weights actually used throughout the pipeline (optimized weights if available,
+# otherwise DEFAULT_WEIGHTS).
+WEIGHTS = load_weights()
+ 
+
+def rotate_coords(coords: np.ndarray, angle_deg: float) -> np.ndarray:
+    if angle_deg == 0:
+        return coords
+    center = coords.mean(axis=0)
+    theta = np.radians(angle_deg)
+    R = np.array([[np.cos(theta), -np.sin(theta)],
+                  [np.sin(theta),  np.cos(theta)]])
+    return (coords - center) @ R.T + center
+
+
+def align_rna_to_msi(rna_coords: np.ndarray, msi_coords: np.ndarray) -> np.ndarray:
+    rna_min, rna_max = rna_coords.min(axis=0), rna_coords.max(axis=0)
+    msi_min, msi_max = msi_coords.min(axis=0), msi_coords.max(axis=0)
+    rna_range = rna_max - rna_min
+    msi_range = msi_max - msi_min
+    scale = min(msi_range[0] / (rna_range[0] + 1e-8),
+                msi_range[1] / (rna_range[1] + 1e-8))
+    rna_center = (rna_min + rna_max) / 2
+    msi_center = (msi_min + msi_max) / 2
+    return (rna_coords - rna_center) * scale + msi_center
+
+
+def compute_value_histogram(values: np.ndarray, n_bins: int = 50) -> np.ndarray:
+    hist, _ = np.histogram(values, bins=n_bins, density=False)
+    return hist / (hist.sum() + 1e-8)
+
+
+def compute_spatial_histogram(coords: np.ndarray, values: np.ndarray, n_bins: int = 10) -> np.ndarray:
+    coord_min, coord_max = coords.min(axis=0), coords.max(axis=0)
+    norm = (coords - coord_min) / (coord_max - coord_min + 1e-8)
+    x_bins = np.clip((norm[:, 0] * n_bins).astype(int), 0, n_bins - 1)
+    y_bins = np.clip((norm[:, 1] * n_bins).astype(int), 0, n_bins - 1)
+    flat_idx = y_bins * n_bins + x_bins
+    hist = np.bincount(flat_idx, weights=values, minlength=n_bins * n_bins).reshape(n_bins, n_bins)
+    counts = np.bincount(flat_idx, minlength=n_bins * n_bins).reshape(n_bins, n_bins)
+    hist = np.divide(hist, counts, where=counts > 0, out=np.zeros_like(hist))
+    hist_min, hist_max = hist.min(), hist.max()
+    if hist_max > hist_min:
+        hist = (hist - hist_min) / (hist_max - hist_min)
+    return hist
+
+
+def compute_radial_profile(coords: np.ndarray, values: np.ndarray, n_rings: int = 10) -> np.ndarray:
+    coord_min, coord_max = coords.min(axis=0), coords.max(axis=0)
+    norm = (coords - coord_min) / (coord_max - coord_min + 1e-8)
+    centroid = norm.mean(axis=0)
+    distances = np.linalg.norm(norm - centroid, axis=1)
+    max_dist = distances.max() + 1e-8
+    ring_idx = np.clip((distances / max_dist * n_rings).astype(int), 0, n_rings - 1)
+    profile = np.bincount(ring_idx, weights=values, minlength=n_rings)
+    counts = np.bincount(ring_idx, minlength=n_rings)
+    profile = np.divide(profile, counts, where=counts > 0, out=np.zeros_like(profile, dtype=float))
+    prof_min, prof_max = profile.min(), profile.max()
+    if prof_max > prof_min:
+        profile = (profile - prof_min) / (prof_max - prof_min)
+    return profile
+
+
+def compute_quadrant_stats(coords: np.ndarray, values: np.ndarray, n_div: int = 3) -> np.ndarray:
+    coord_min, coord_max = coords.min(axis=0), coords.max(axis=0)
+    norm = (coords - coord_min) / (coord_max - coord_min + 1e-8)
+    x_bins = np.clip((norm[:, 0] * n_div).astype(int), 0, n_div - 1)
+    y_bins = np.clip((norm[:, 1] * n_div).astype(int), 0, n_div - 1)
+    flat_idx = y_bins * n_div + x_bins
+    stats = np.zeros(n_div * n_div * 2)
+    for q in range(n_div * n_div):
+        mask = flat_idx == q
+        if mask.sum() > 0:
+            q_vals = values[mask]
+            stats[q * 2] = np.mean(q_vals)
+            stats[q * 2 + 1] = np.std(q_vals)
+    stats_min, stats_max = stats.min(), stats.max()
+    if stats_max > stats_min:
+        stats = (stats - stats_min) / (stats_max - stats_min)
+    return stats
+
+
+def fast_pearsonr(a: np.ndarray, b: np.ndarray) -> float:
+    """Faster Pearson correlation without p-value computation."""
+    a = a.flatten()
+    b = b.flatten()
+    if len(a) < 2 or a.std() == 0 or b.std() == 0:
+        return 0.0
+    a_centered = a - a.mean()
+    b_centered = b - b.mean()
+    numer = np.dot(a_centered, b_centered)
+    denom = np.sqrt(np.dot(a_centered, a_centered) * np.dot(b_centered, b_centered))
+    if denom == 0:
+        return 0.0
+    return numer / denom
+
+
+def fast_pearsonr_batch(single: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """
+    Pearson correlation of `single` (1D, length D) against every row of
+    `matrix` (N×D).  Returns (N,) array of correlations.
+    """
+    single = single.flatten().astype(np.float64)
+    if matrix.ndim == 1:
+        matrix = matrix.reshape(1, -1)
+    matrix = matrix.astype(np.float64)
+
+    s_centered = single - single.mean()
+    s_ss = np.dot(s_centered, s_centered)
+    if s_ss == 0:
+        return np.zeros(matrix.shape[0])
+
+    m_centered = matrix - matrix.mean(axis=1, keepdims=True)
+    m_ss = np.sum(m_centered ** 2, axis=1)
+
+    numerators = m_centered @ s_centered
+    denominators = np.sqrt(s_ss * m_ss)
+
+    result = np.zeros(matrix.shape[0])
+    valid = denominators > 0
+    result[valid] = numerators[valid] / denominators[valid]
+    return result
+
+
+@dataclass
+class SpatialSignature:
+    sample_id: str
+    feature_name: str
+    feature_type: str
+    node_importance: np.ndarray
+    value_histogram: np.ndarray = None
+    spatial_histogram: np.ndarray = None
+    radial_profile: np.ndarray = None
+    quadrant_stats: np.ndarray = None
+    coordinates: np.ndarray = None
+    raw_values: np.ndarray = None
+    aligned_coordinates: Optional[np.ndarray] = None
+
+
+def compute_coordinate_based_similarity(gene_sig: SpatialSignature, mz_sig: SpatialSignature, grid_res: int = 50) -> dict:
+    gene_coords = gene_sig.aligned_coordinates if gene_sig.aligned_coordinates is not None else gene_sig.coordinates
+    mz_coords = mz_sig.coordinates
+    x_min, x_max = mz_coords[:, 0].min(), mz_coords[:, 0].max()  
+    y_min, y_max = mz_coords[:, 1].min(), mz_coords[:, 1].max() 
+    grid_x, grid_y = np.meshgrid(np.linspace(x_min, x_max, grid_res), np.linspace(y_min, y_max, grid_res))
+    gene_grid = griddata(gene_coords, gene_sig.raw_values, (grid_x, grid_y), method='linear')
+    mz_grid = griddata(mz_coords, mz_sig.raw_values, (grid_x, grid_y), method='linear')
+    gene_imp_grid = griddata(gene_coords, gene_sig.node_importance, (grid_x, grid_y), method='linear')
+    mz_imp_grid = griddata(mz_coords, mz_sig.node_importance, (grid_x, grid_y), method='linear')
+    mask = ~(np.isnan(gene_grid) | np.isnan(mz_grid))
+    value_corr = 0
+    if mask.sum() > 10:
+        r, _ = pearsonr(gene_grid[mask], mz_grid[mask])
+        value_corr = r if not np.isnan(r) else 0
+    mask_imp = ~(np.isnan(gene_imp_grid) | np.isnan(mz_imp_grid))
+    importance_iou, imp_corr = 0, 0
+    if mask_imp.sum() > 0:
+        g_imp = gene_imp_grid.copy()
+        m_imp = mz_imp_grid.copy()
+        g_imp[np.isnan(g_imp)] = 0
+        m_imp[np.isnan(m_imp)] = 0
+        g_imp = g_imp / (g_imp.max() + 1e-8)
+        m_imp = m_imp / (m_imp.max() + 1e-8)
+        importance_iou = (np.minimum(g_imp[mask_imp], m_imp[mask_imp]).sum() / 
+                          (np.maximum(g_imp[mask_imp], m_imp[mask_imp]).sum() + 1e-8))
+        r, _ = pearsonr(g_imp[mask_imp], m_imp[mask_imp])
+        imp_corr = r if not np.isnan(r) else 0
+    return {'value_correlation': value_corr, 'importance_iou': importance_iou, 'importance_correlation': imp_corr}
+
+
+def compute_descriptor_similarity(gene_sig: SpatialSignature, mz_sig: SpatialSignature) -> dict:
+    def safe_pearsonr(a, b):
+        if a.std() > 0 and b.std() > 0:
+            r, _ = pearsonr(a, b)
+            return r if not np.isnan(r) else 0
+        return 0
+    val_hist_corr = safe_pearsonr(gene_sig.value_histogram, mz_sig.value_histogram)
+    spatial_hist_corr = safe_pearsonr(gene_sig.spatial_histogram.flatten(), mz_sig.spatial_histogram.flatten())
+    radial_corr = safe_pearsonr(gene_sig.radial_profile, mz_sig.radial_profile)
+    quad_corr = safe_pearsonr(gene_sig.quadrant_stats, mz_sig.quadrant_stats)
+    return {'value_hist_corr': val_hist_corr, 'spatial_hist_corr': spatial_hist_corr, 
+            'radial_corr': radial_corr, 'quadrant_corr': quad_corr}
+
+
+def compute_combined_score(coord_sim: dict, desc_sim: dict, weights: dict = None) -> float:  
+    if weights is None: 
+        weights = DEFAULT_WEIGHTS  
+    coord_score = (weights['value_correlation'] * max(coord_sim['value_correlation'], 0) +
+                   weights['importance_iou'] * max(coord_sim['importance_iou'], 0) +
+                   weights['importance_correlation'] * max(coord_sim['importance_correlation'], 0))
+    desc_score = (weights['spatial_hist_corr'] * max(desc_sim['spatial_hist_corr'], 0) +
+                  weights['radial_corr'] * max(desc_sim['radial_corr'], 0) +
+                  weights['quadrant_corr'] * max(desc_sim['quadrant_corr'], 0) +
+                  weights['value_hist_corr'] * max(desc_sim['value_hist_corr'], 0))
+    return coord_score + desc_score
+
+
+class AnalyticPatternMatcher:
+    def __init__(self, output_dir: str = './gene_to_mz_results_v1_analytic', n_jobs: int = -1,
+                 rna_rotation: float = 0.0):
+        self.output_dir = output_dir
+        self.n_jobs = n_jobs
+        self.rna_rotation = rna_rotation  
+        for subdir in ['descriptors']:
+            os.makedirs(os.path.join(output_dir, subdir), exist_ok=True)
+        self.rna_data = {}
+        self.msi_data = {}
+        self._nn_cache = {}
+        self._msi_dense_cache = {}       # sample_id -> dense matrix
+        self._msi_grid_cache = {}        # sample_id -> {mz_name -> {'values': grid, 'importance': grid}}
+        self._msi_sig_cache = {}         # sample_id -> {mz_name -> SpatialSignature}
+        self._msi_descriptor_stack = {}  # sample_id -> stacked descriptor matrices
+        self._rna_dense_cache = {}       # sample_id -> dense matrix
+        self._rna_gene_idx = {}          # sample_id -> {gene_name -> col_index}
+        self.grid_res = 50
+
+    def load_all_data(self):
+        print("Loading RNA-seq data...")
+        print(f"  Pixel size: {RNA_PIXEL_SIZE} μm (hexagonal)")
+        for file, sample_id in zip(RNA_SAMPLE_FILES, RNA_SAMPLE_IDS):
+            path = os.path.join(RNA_INPUT_FOLDER, file)
+            if os.path.exists(path):
+                self.rna_data[sample_id] = sc.read_h5ad(path)
+                print(f"  {sample_id}: {self.rna_data[sample_id].shape}")
+                adata = self.rna_data[sample_id]
+                self._rna_dense_cache[sample_id] = (
+                    adata.X.toarray() if hasattr(adata.X, 'toarray') else np.array(adata.X)
+                )
+                self._rna_gene_idx[sample_id] = {
+                    name: i for i, name in enumerate(adata.var_names)
+                }
+        print(f"\nLoading MSI data...")
+        print(f"  Pixel size: {MSI_PIXEL_SIZE} μm (Cartesian)")
+        for file, sample_id in zip(MSI_SAMPLE_FILES, MSI_SAMPLE_IDS):
+            path = os.path.join(MSI_INPUT_FOLDER, file)
+            if os.path.exists(path):
+                self.msi_data[sample_id] = sc.read_h5ad(path)
+                print(f"  {sample_id}: {self.msi_data[sample_id].shape}")
+                msi_adata = self.msi_data[sample_id]
+                self._msi_dense_cache[sample_id] = (
+                    msi_adata.X.toarray() if hasattr(msi_adata.X, 'toarray') else np.array(msi_adata.X)
+                )
+
+    def _get_nn_indices(self, coords: np.ndarray, k: int, cache_key: str) -> np.ndarray:
+        full_key = f"{cache_key}_{k}"
+        if full_key not in self._nn_cache:
+            coord_min, coord_max = coords.min(axis=0), coords.max(axis=0)
+            norm = (coords - coord_min) / (coord_max - coord_min + 1e-8)
+            k_actual = min(k + 1, len(coords))
+            nn = NearestNeighbors(n_neighbors=k_actual)
+            nn.fit(norm)
+            _, indices = nn.kneighbors(norm)
+            self._nn_cache[full_key] = indices
+        return self._nn_cache[full_key]
+
+    def compute_bio_importance(self, coords: np.ndarray, values: np.ndarray, nn_indices: np.ndarray) -> np.ndarray:
+        neighbor_vals = values[nn_indices[:, 1:]]
+        local_var = np.var(neighbor_vals, axis=1)
+        lv_min, lv_max = local_var.min(), local_var.max()
+        if lv_max > lv_min:
+            local_var = (local_var - lv_min) / (lv_max - lv_min)
+        else:
+            local_var = np.zeros_like(local_var)
+        v_min, v_max = values.min(), values.max()
+        if v_max > v_min:
+            val_norm = (values - v_min) / (v_max - v_min)
+        else:
+            val_norm = np.zeros_like(values)
+        return 0.5 * local_var + 0.5 * val_norm
+
+    def extract_signature(self, coords: np.ndarray, values: np.ndarray, sample_id: str,
+                          feature_name: str, feature_type: str, n_neighbors: int,
+                          nn_indices: np.ndarray, aligned_coords: Optional[np.ndarray] = None) -> SpatialSignature:
+        bio_imp = self.compute_bio_importance(coords, values, nn_indices)
+        return SpatialSignature(
+            sample_id=sample_id, feature_name=feature_name, feature_type=feature_type,
+            node_importance=bio_imp, value_histogram=compute_value_histogram(values),
+            spatial_histogram=compute_spatial_histogram(coords, values),
+            radial_profile=compute_radial_profile(coords, values),
+            quadrant_stats=compute_quadrant_stats(coords, values),
+            coordinates=coords, raw_values=values, aligned_coordinates=aligned_coords)
+
+    def precompute_msi_cache(self, msi_sample: str):
+        """
+        Pre-compute and cache all MSI signatures + grid interpolations.
+        MSI data is invariant across genes, so this is done once per sample.
+        """
+        if msi_sample in self._msi_sig_cache:
+            return  # already cached
+
+        t0 = time.time()
+        print(f"    [Cache] Pre-computing MSI signatures for {msi_sample}...")
+
+        msi_adata = self.msi_data[msi_sample]
+        msi_coords = np.column_stack([msi_adata.obs['x_um'].values, msi_adata.obs['y_um'].values])
+        msi_data = self._msi_dense_cache[msi_sample]  
+        mz_names = list(msi_adata.var_names)
+        msi_nn_indices = self._get_nn_indices(msi_coords, 8, f"msi_{msi_sample}")
+
+        x_min, x_max = msi_coords[:, 0].min(), msi_coords[:, 0].max()
+        y_min, y_max = msi_coords[:, 1].min(), msi_coords[:, 1].max()
+        grid_x, grid_y = np.meshgrid(
+            np.linspace(x_min, x_max, self.grid_res),
+            np.linspace(y_min, y_max, self.grid_res)
+        )
+
+        # build Delaunay triangulation once for MSI coords
+        msi_tri = Delaunay(msi_coords)
+
+        sigs = {}
+        grids = {}
+
+        # stacked descriptor arrays for batch correlation later
+        val_hists = []
+        spat_hists = []
+        radial_profs = []
+        quad_stats_arr = []
+
+        for i, mz_name in enumerate(mz_names):
+            vals = msi_data[:, i]
+            importance = self.compute_bio_importance(msi_coords, vals, msi_nn_indices)
+
+            sig = SpatialSignature(
+                sample_id=msi_sample, feature_name=mz_name, feature_type='mz',
+                node_importance=importance,
+                value_histogram=compute_value_histogram(vals),
+                spatial_histogram=compute_spatial_histogram(msi_coords, vals),
+                radial_profile=compute_radial_profile(msi_coords, vals),
+                quadrant_stats=compute_quadrant_stats(msi_coords, vals),
+                coordinates=msi_coords, raw_values=vals
+            )
+            sigs[mz_name] = sig
+
+            # reuse Delaunay triangulation for grid interpolation
+            val_interp = LinearNDInterpolator(msi_tri, vals)
+            imp_interp = LinearNDInterpolator(msi_tri, importance)
+            grids[mz_name] = {
+                'values': val_interp(grid_x, grid_y),
+                'importance': imp_interp(grid_x, grid_y)
+            }
+
+            # collect descriptors for batch stacking
+            val_hists.append(sig.value_histogram)
+            spat_hists.append(sig.spatial_histogram.flatten())
+            radial_profs.append(sig.radial_profile)
+            quad_stats_arr.append(sig.quadrant_stats)
+
+        self._msi_sig_cache[msi_sample] = sigs
+        self._msi_grid_cache[msi_sample] = grids
+        # pre-stack for batch correlation
+        self._msi_descriptor_stack[msi_sample] = {
+            'mz_names': mz_names,
+            'val_hists': np.array(val_hists),        # (n_mz, 50)
+            'spat_hists': np.array(spat_hists),      # (n_mz, 100)
+            'radial_profs': np.array(radial_profs),   # (n_mz, 10)
+            'quad_stats': np.array(quad_stats_arr),    # (n_mz, 18)
+            'grid_x': grid_x,
+            'grid_y': grid_y,
+        }
+
+        print(f"    [Cache] {len(mz_names)} m/z features cached in {time.time()-t0:.1f}s")
+
+    # vectorized matching across all m/z at once
+    def find_matches_fast(self, gene_sig: SpatialSignature, msi_sample: str, top_k: int = 20) -> pd.DataFrame:
+        """
+        Vectorized matching: compute all 7 metrics for all m/z features
+        using pre-cached MSI data, with batch Pearson correlations.
+        """
+        stack = self._msi_descriptor_stack[msi_sample]
+        grids = self._msi_grid_cache[msi_sample]
+        sigs = self._msi_sig_cache[msi_sample]
+        mz_names = stack['mz_names']
+        n_mz = len(mz_names)
+        grid_x = stack['grid_x']
+        grid_y = stack['grid_y']
+
+        gene_coords = gene_sig.aligned_coordinates if gene_sig.aligned_coordinates is not None else gene_sig.coordinates
+
+        # build gene Delaunay once, interpolate values + importance
+        gene_tri = Delaunay(gene_coords)
+        gene_val_interp = LinearNDInterpolator(gene_tri, gene_sig.raw_values)
+        gene_imp_interp = LinearNDInterpolator(gene_tri, gene_sig.node_importance)
+        gene_grid = gene_val_interp(grid_x, grid_y)
+        gene_imp_grid = gene_imp_interp(grid_x, grid_y)
+
+        # batch descriptor correlations (one matrix op per descriptor)
+        val_hist_corrs = fast_pearsonr_batch(gene_sig.value_histogram, stack['val_hists'])
+        spat_hist_corrs = fast_pearsonr_batch(gene_sig.spatial_histogram.flatten(), stack['spat_hists'])
+        radial_corrs = fast_pearsonr_batch(gene_sig.radial_profile, stack['radial_profs'])
+        quad_corrs = fast_pearsonr_batch(gene_sig.quadrant_stats, stack['quad_stats'])
+
+        # coordinate-based metrics — loop over m/z but reuse gene grid
+        value_corrs = np.zeros(n_mz)
+        importance_ious = np.zeros(n_mz)
+        importance_corrs = np.zeros(n_mz)
+
+        for i, mz_name in enumerate(mz_names):
+            mz_grid_vals = grids[mz_name]['values']
+            mz_grid_imp = grids[mz_name]['importance']
+
+            # Value correlation
+            mask = ~(np.isnan(gene_grid) | np.isnan(mz_grid_vals))
+            if mask.sum() > 10:
+                value_corrs[i] = fast_pearsonr(gene_grid[mask], mz_grid_vals[mask])
+
+            # Importance metrics
+            mask_imp = ~(np.isnan(gene_imp_grid) | np.isnan(mz_grid_imp))
+            if mask_imp.sum() > 0:
+                gi = np.nan_to_num(gene_imp_grid, nan=0.0)
+                mi = np.nan_to_num(mz_grid_imp, nan=0.0)
+                gi_max = gi.max()
+                mi_max = mi.max()
+                if gi_max > 0:
+                    gi = gi / gi_max
+                if mi_max > 0:
+                    mi = mi / mi_max
+                importance_ious[i] = (np.minimum(gi[mask_imp], mi[mask_imp]).sum() /
+                                      (np.maximum(gi[mask_imp], mi[mask_imp]).sum() + 1e-8))
+                importance_corrs[i] = fast_pearsonr(gi[mask_imp], mi[mask_imp])
+
+        # vectorized combined score for all m/z at once
+        w = DEFAULT_WEIGHTS
+        combined_scores = (
+            w['value_correlation']      * np.maximum(value_corrs, 0) +
+            w['importance_iou']         * np.maximum(importance_ious, 0) +
+            w['importance_correlation'] * np.maximum(importance_corrs, 0) +
+            w['value_hist_corr']        * np.maximum(val_hist_corrs, 0) +
+            w['spatial_hist_corr']      * np.maximum(spat_hist_corrs, 0) +
+            w['radial_corr']            * np.maximum(radial_corrs, 0) +
+            w['quadrant_corr']          * np.maximum(quad_corrs, 0)
+        )
+
+        # Build DataFrame
+        df = pd.DataFrame({
+            'gene': gene_sig.feature_name,
+            'rna_sample': gene_sig.sample_id,
+            'mz_feature': mz_names,
+            'msi_sample': msi_sample,
+            'value_correlation': value_corrs,
+            'importance_iou': importance_ious,
+            'importance_correlation': importance_corrs,
+            'value_hist_corr': val_hist_corrs,
+            'spatial_hist_corr': spat_hist_corrs,
+            'radial_corr': radial_corrs,
+            'quadrant_corr': quad_corrs,
+            'combined_score': combined_scores,
+        })
+
+        return df.sort_values('combined_score', ascending=False).head(top_k)
+
+    def run_analysis(self, top_k=20):
+        print("\n" + "="*70)
+        print("GENE-TO-M/Z MATCHING V1 (Analytic - Optimized)") 
+        print(f"RNA: {RNA_PIXEL_SIZE}μm (hexagonal) | MSI: {MSI_PIXEL_SIZE}μm (Cartesian)")
+        print("Strategy: Analytic Spatial Descriptors + Heuristic Importance")
+        print("="*70)
+        gene_avail = {gene: {s: gene in self.rna_data[s].var_names
+                             for s in RNA_SAMPLE_IDS if s in self.rna_data}
+                      for gene in AAD_TARGET_GENES}
+        print("\nGene availability:")
+        for gene in AAD_TARGET_GENES:
+            n = sum(gene_avail[gene].values())
+            print(f"  {gene}: {n}/{len(RNA_SAMPLE_IDS)}")
+        all_results = []
+        all_topk_results = []
+        for gene in AAD_TARGET_GENES:
+            print(f"\n{'='*50}")
+            print(f"Gene: {gene}")
+            print(f"{'='*50}")
+            available = [s for s, a in gene_avail[gene].items() if a]
+            if not available:
+                continue
+            for rna_sample in available:
+                t_sample = time.time()  # timing
+                print(f"\n  {rna_sample}")
+                adata = self.rna_data[rna_sample]
+                rna_coords = np.column_stack([adata.obs['x_um'].values, adata.obs['y_um'].values])
+                rna_coords = rotate_coords(rna_coords, self.rna_rotation)
+
+                # use pre-built gene index map instead of list.index()
+                gene_idx = self._rna_gene_idx[rna_sample][gene]
+                gene_expr = self._rna_dense_cache[rna_sample][:, gene_idx]  # pre-densified
+
+                msi_sample = rna_sample
+                if msi_sample not in self.msi_data:
+                    print(f"    MSI {msi_sample} not found")
+                    continue
+
+                msi_adata = self.msi_data[msi_sample]
+                msi_coords = np.column_stack([msi_adata.obs['x_um'].values, msi_adata.obs['y_um'].values])
+                aligned_coords = align_rna_to_msi(rna_coords, msi_coords)
+                rna_nn_indices = self._get_nn_indices(rna_coords, 6, f"rna_{rna_sample}")
+
+                gene_sig = self.extract_signature(rna_coords, gene_expr, rna_sample, gene, 'gene', 6, rna_nn_indices, aligned_coords)
+
+                # Save gene descriptors
+                with open(os.path.join(self.output_dir, 'descriptors', f'{gene}_{rna_sample}_descriptors.pkl'), 'wb') as f:
+                    pickle.dump({
+                        'feature_name': gene_sig.feature_name, 'sample_id': gene_sig.sample_id,
+                        'feature_type': gene_sig.feature_type, 'value_histogram': gene_sig.value_histogram,
+                        'spatial_histogram': gene_sig.spatial_histogram, 'radial_profile': gene_sig.radial_profile,
+                        'quadrant_stats': gene_sig.quadrant_stats, 'coordinates': gene_sig.coordinates, 
+                        'aligned_coordinates': gene_sig.aligned_coordinates,
+                        'expression_stats': {
+                            'mean': float(gene_sig.raw_values.mean()), 'std': float(gene_sig.raw_values.std()),
+                            'min': float(gene_sig.raw_values.min()), 'max': float(gene_sig.raw_values.max()),
+                            'median': float(np.median(gene_sig.raw_values)), 'n_spots': len(gene_sig.raw_values),
+                            'n_nonzero': int((gene_sig.raw_values > 0).sum())},
+                        'importance_stats': {
+                            'mean': float(gene_sig.node_importance.mean()), 'std': float(gene_sig.node_importance.std()),
+                            'top_10pct_threshold': float(np.percentile(gene_sig.node_importance, 90))}}, f)
+
+                # pre-compute MSI cache if not done yet (one-time per sample)
+                self.precompute_msi_cache(msi_sample)
+
+                # use vectorized matching instead of per-m/z loop with joblib
+                print(f"    Matching against {len(self._msi_sig_cache[msi_sample])} m/z features...")
+                matches = self.find_matches_fast(gene_sig, msi_sample, top_k)
+
+                all_results.append(matches)
+                topk_matches = matches.head(top_k).copy()
+                topk_matches['gene'] = gene
+                topk_matches['rna_sample'] = rna_sample
+                topk_matches['rank'] = range(1, len(topk_matches) + 1)
+                all_topk_results.append(topk_matches)
+
+                if len(matches) > 0:
+                    print(f"\n    Top {top_k}:")
+                    for idx in range(min(top_k, len(matches))):
+                        m = matches.iloc[idx]
+                        print(f"      {idx+1}. m/z {m['mz_feature']}: {m['combined_score']:.3f}")
+
+                    # Save top k match descriptors
+                    mz_sigs = self._msi_sig_cache[msi_sample]  # use cached sigs
+                    for idx in range(min(top_k, len(matches))):
+                        m = matches.iloc[idx]
+                        mz_name = m['mz_feature']
+                        mz_sig = mz_sigs[mz_name]
+                        mz_filename = mz_name.replace('/', '_').replace('\\', '_')
+                        with open(os.path.join(self.output_dir, 'descriptors',
+                                               f'{gene}_{rna_sample}_match{idx+1}_{mz_filename}_descriptors.pkl'), 'wb') as f:
+                            pickle.dump({
+                                'gene': gene, 'gene_sample': rna_sample, 'mz_feature': mz_name,
+                                'mz_sample': mz_sig.sample_id, 'match_rank': idx + 1,
+                                'combined_score': float(m['combined_score']),
+                                'mz_value_histogram': mz_sig.value_histogram, 'mz_spatial_histogram': mz_sig.spatial_histogram,
+                                'mz_radial_profile': mz_sig.radial_profile, 'mz_quadrant_stats': mz_sig.quadrant_stats,
+                                'gene_value_histogram': gene_sig.value_histogram, 'gene_spatial_histogram': gene_sig.spatial_histogram, 
+                                'gene_radial_profile': gene_sig.radial_profile, 'gene_quadrant_stats': gene_sig.quadrant_stats,
+                                'similarity_scores': {k: float(v) if isinstance(v, (int, float, np.floating)) else v
+                                                      for k, v in m.items() if k not in ['gene', 'rna_sample', 'mz_feature', 'msi_sample']}}, f)
+
+                print(f"    Sample done in {time.time()-t_sample:.1f}s")  # timing
+
+        if all_results:
+            results = pd.concat(all_results, ignore_index=True)
+            results = results.sort_values('combined_score', ascending=False)
+            results.to_csv(os.path.join(self.output_dir, 'gene_to_mz_matches_v1_analytic.csv'), index=False)
+            if all_topk_results:
+                topk_df = pd.concat(all_topk_results, ignore_index=True)
+                priority_cols = ['gene', 'rna_sample', 'rank', 'mz_feature', 'msi_sample', 'combined_score']
+                other_cols = [c for c in topk_df.columns if c not in priority_cols]
+                topk_df = topk_df[priority_cols + other_cols]
+                topk_df = topk_df.sort_values(['gene', 'rna_sample', 'rank'])
+                topk_df.to_csv(os.path.join(self.output_dir, f'gene_to_mz_top{TOP_K_MATCHES}_matches_all_scores.csv'), index=False)
+            print(f"\nSaved results to: {self.output_dir}")
+            print("\n" + "="*70)
+            print("TOP MATCHES")
+            print("="*70)
+            for gene in AAD_TARGET_GENES:
+                gr = results[results['gene'] == gene]
+                if len(gr) > 0:
+                    t = gr.iloc[0]
+                    print(f"\n{gene}: m/z {t['mz_feature']} ({t['rna_sample']}) = {t['combined_score']:.3f}")
+            return results
+        return None
+
+
+def main():
+    print("="*70)
+    print("Analytic Spatial Matching - Optimized") 
+    print(f"RNA: {RNA_PIXEL_SIZE}μm | MSI: {MSI_PIXEL_SIZE}μm")
+    print("="*70)
+    matcher = AnalyticPatternMatcher(output_dir=f'./{TOP_K_MATCHES}_gene_to_mz_synced_results_v1_analytic_fast', 
+                                     n_jobs=-1,
+                                     rna_rotation=RNA_ROTATION_ANGLE)
+    matcher.load_all_data()
+    results = matcher.run_analysis(top_k=TOP_K_MATCHES)
+    print("\n" + "="*70)
+    print("COMPLETE!")
+    print("="*70)
+    return matcher, results
+
+
+if __name__ == "__main__":
+    matcher, results = main()
