@@ -1,3 +1,4 @@
+import os
 import json
 import numpy as np
 import pandas as pd
@@ -5,18 +6,24 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 
-FILE_PATH = "/home/ajarrah/PhD_Thesis/rotation_analysis_optimized_50_340_20_2/rotation_scores_optimized.csv"
+
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MOS")
+MSI_INPUT_FOLDER = os.path.join(BASE_DIR, "MOS/dummy_data_50/msi/")
+RNA_INPUT_FOLDER = os.path.join(BASE_DIR, "MOS/dummy_data_50/rna/")
+OUTPUT_FOLDER = os.path.join(BASE_DIR, 'MOS/rotation_analysis')
+
+FILE_PATH = os.path.join(BASE_DIR, "rotation_analysis/rotation_scores_optimized.csv")
 ANGLE_MIN, ANGLE_MAX = 340, 20
 PLOT_RESULTS = True
 
 # Plot saving
 SAVE_PLOT = True
-PLOT_SAVE_PATH = "/home/ajarrah/PhD_Thesis/rotation_analysis_optimized_50_340_20_2/optimized_accuracy_by_angle.png"
+PLOT_SAVE_PATH = os.path.join(BASE_DIR, "rotation_analysis/optimized_accuracy_by_angle.png")
 PLOT_DPI = 300
 
 # Weight export, so 1_0_0_fast_new.py can load the optimized weights directly
 SAVE_WEIGHTS = True
-WEIGHTS_SAVE_PATH = "/home/ajarrah/PhD_Thesis/rotation_analysis_optimized_50_340_20_2/optimized_weights.json"
+WEIGHTS_SAVE_PATH = os.path.join(BASE_DIR, "rotation_analysis/optimized_weights.json")
 
 
 METRIC_ROOTS = [

@@ -41,8 +41,11 @@ ANGLE_START = 340    # Start angle in degrees
 ANGLE_END = 20      # End angle in degrees
 ANGLE_STEP = 2     # Step size in degrees
 
-MSI_INPUT_FOLDER = "/home/ajarrah/PhD_Thesis/chapter_4/dummy_data_50/msi/"
-RNA_INPUT_FOLDER = "/home/ajarrah/PhD_Thesis/chapter_4/dummy_data_50/rna/"
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MOS")
+MSI_INPUT_FOLDER = os.path.join(BASE_DIR, "dummy_data_50/msi/")
+RNA_INPUT_FOLDER = os.path.join(BASE_DIR, "dummy_data_50/rna/")
+OUTPUT_FOLDER = os.path.join(BASE_DIR, 'rotation_analysis')
+
 
 MSI_SAMPLE_FILES = [
     "halfbrain_yc_1_filtered_common.h5ad", "halfbrain_yc_2_filtered_common.h5ad",
@@ -137,8 +140,6 @@ AAD_TARGET_GENES = [
     "Gene_Periventricular",         # Around a central void
     "Gene_Asymmetric_Lobe",         # Asymmetric lobed structure
 ]
-
-OUTPUT_FOLDER = f'./rotation_analysis_optimized_{len(AAD_TARGET_GENES)}_{ANGLE_START}_{ANGLE_END}_{ANGLE_STEP}'
 
 
 # =============================================================================

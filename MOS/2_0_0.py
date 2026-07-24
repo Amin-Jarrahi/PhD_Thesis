@@ -62,10 +62,11 @@ MASS_DIFF_TOLERANCE = 0.01
 
 # Isotope identification thresholds
 MIN_ANIMALS = 12
-MIN_SCORE = 60
+MIN_SCORE = 45
 
 # Output directory
-OUTPUT_DIR = './mz_isotope_results'
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MOS")
+OUTPUT_DIR = os.path.join(BASE_DIR, "mz_isotope_results")
 
 # Stage 3 configuration
 HIERARCHY_PRECISION = 4

@@ -25,6 +25,7 @@ warnings.filterwarnings('ignore')
 # =============================================================================
 # DATA CONFIGURATION
 # =============================================================================
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MOS")
 
 RNA_PIXEL_SIZE = 55  # μm (Visium)
 MSI_PIXEL_SIZE = 60  # μm
@@ -72,8 +73,9 @@ AAD_TARGET_GENES = ['Eno1', 'Mapt', 'Thy1', 'Pmch', 'Atp1a3', 'Rac1', 'Rsrp1', '
 # Path to the weights JSON produced by 0_2_0_new.py's optimize_weights() /
 # save_weights(). If this file exists it is loaded and used instead of
 # DEFAULT_WEIGHTS below.
-WEIGHTS_FILE_PATH = "/home/ajarrah/PhD_Thesis/rotation_analysis_optimized_50_340_20_2/optimized_weights.json"
-
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MOS")
+WEIGHTS_FILE_PATH = os.path.join(BASE_DIR, "rotation_analysis/optimized_weights.json")
+OUTPUT_DIR = os.path.join(BASE_DIR, "gene_to_mz_results")
 
 # Fallback weights, used only if WEIGHTS_FILE_PATH doesn't exist / can't be loaded.
 DEFAULT_WEIGHTS = {
@@ -312,7 +314,7 @@ def compute_combined_score(coord_sim: dict, desc_sim: dict, weights: dict = None
 
 
 class AnalyticPatternMatcher:
-    def __init__(self, output_dir: str = './gene_to_mz_results_v1_analytic', n_jobs: int = -1,
+    def __init__(self, output_dir: str = './gene_to_mz_results', n_jobs: int = -1,
                  rna_rotation: float = 0.0):
         self.output_dir = output_dir
         self.n_jobs = n_jobs
@@ -671,14 +673,14 @@ class AnalyticPatternMatcher:
         if all_results:
             results = pd.concat(all_results, ignore_index=True)
             results = results.sort_values('combined_score', ascending=False)
-            results.to_csv(os.path.join(self.output_dir, 'gene_to_mz_matches_v1_analytic.csv'), index=False)
+            results.to_csv(os.path.join(self.output_dir, 'gene_to_mz_matches_analytic.csv'), index=False)
             if all_topk_results:
                 topk_df = pd.concat(all_topk_results, ignore_index=True)
                 priority_cols = ['gene', 'rna_sample', 'rank', 'mz_feature', 'msi_sample', 'combined_score']
                 other_cols = [c for c in topk_df.columns if c not in priority_cols]
                 topk_df = topk_df[priority_cols + other_cols]
                 topk_df = topk_df.sort_values(['gene', 'rna_sample', 'rank'])
-                topk_df.to_csv(os.path.join(self.output_dir, f'gene_to_mz_top{TOP_K_MATCHES}_matches_all_scores.csv'), index=False)
+                topk_df.to_csv(os.path.join(self.output_dir, f'gene_to_mz_top_k_matches_all_scores.csv'), index=False)
             print(f"\nSaved results to: {self.output_dir}")
             print("\n" + "="*70)
             print("TOP MATCHES")
@@ -697,7 +699,7 @@ def main():
     print("Analytic Spatial Matching - Optimized") 
     print(f"RNA: {RNA_PIXEL_SIZE}μm | MSI: {MSI_PIXEL_SIZE}μm")
     print("="*70)
-    matcher = AnalyticPatternMatcher(output_dir=f'./{TOP_K_MATCHES}_gene_to_mz_synced_results_v1_analytic_fast', 
+    matcher = AnalyticPatternMatcher(output_dir=OUTPUT_DIR, 
                                      n_jobs=-1,
                                      rna_rotation=RNA_ROTATION_ANGLE)
     matcher.load_all_data()
