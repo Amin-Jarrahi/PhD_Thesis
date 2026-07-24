@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,10 +8,14 @@ from itertools import combinations
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-INPUT_FILE = '26_gene_to_mz_synced_results_v1_analytic_fast/gene_to_mz_top26_matches_all_scores.csv'
-VALIDATION_FILE = "/home/ajarrah/PhD_Thesis/mz_isotope_results/parent_children_hierarchy.csv"
-OUTPUT_CSV = "26_gene_to_mz_synced_results_v1_analytic_fast/gene_consensus_detailed_samples.csv"
-OUTPUT_FIG = "26_gene_to_mz_synced_results_v1_analytic_fast/gene_mz_consensus_heatmap.png"
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MOS")
+
+INPUT_FILE = os.path.join(BASE_DIR,'gene_to_mz_results/gene_to_mz_top_k_matches_all_scores.csv')
+VALIDATION_FILE = os.path.join(BASE_DIR,"mz_isotope_results/parent_children_hierarchy.csv")
+
+OUTPUT_DIR = os.path.join(BASE_DIR, "gene_to_mz_results")
+OUTPUT_CSV = os.path.join(OUTPUT_DIR, "gene_consensus_detailed_samples.csv")
+OUTPUT_FIG = os.path.join(OUTPUT_DIR, "gene_mz_consensus_heatmap.png")
 
 K_FACTOR = 1
 SYNERGY_WEIGHT = 0.2

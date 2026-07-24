@@ -1,0 +1,9 @@
+{
+  "value_correlation": 0.0003675868695626229,
+  "importance_iou": 0.1380762627310829,
+  "importance_correlation": 0.00390174606144703,
+  "value_hist_corr": 0.30218170194955024,
+  "spatial_hist_corr": 0.1962690368915676,
+  "radial_corr": 0.23930589537835867,
+  "quadrant_corr": 0.11989777011843085
+}
